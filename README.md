@@ -1,5 +1,5 @@
 ## ok
-A general-purpose programming language that is data-oriented and concurrent-by-default.
+A general-purpose programming language that is data-oriented and highly parallel.
 
 ## TODO:
 - Design and implement it.
