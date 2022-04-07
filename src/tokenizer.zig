@@ -6,6 +6,8 @@ pub const Token = struct {
     start: usize,
     len: usize,
     raw: []const u8,
+    line: usize,
+    offset: usize,
 
     pub const Kind = enum {
         // single symbol tokens
@@ -51,7 +53,10 @@ pub const Token = struct {
         period_period,
 
         // literal tokens
-        number,
+        dec_number,
+        hex_number,
+        oct_number,
+        bin_number,
         string,
 
         // identifier tokens
@@ -70,8 +75,14 @@ pub const Token = struct {
 const TokenList = std.ArrayList(Token);
 
 const State = struct {
-    source: []const u8,
-    curr: enum {
+    in: []const u8,
+    mode: Mode,
+    start: ?usize,
+    out: TokenList,
+    line: usize,
+    line_start: usize,
+
+    const Mode = enum {
         hash,
         ampersand,
         minus,
@@ -81,7 +92,10 @@ const State = struct {
         semi_colon,
         colon,
         period,
-        number,
+        dec_number,
+        hex_number,
+        oct_number,
+        bin_number,
         string,
         builtin,
         identifier,
@@ -90,235 +104,603 @@ const State = struct {
         doc_comment,
         invalid,
         none,
-    },
-    curr_start: usize,
-    tokens: TokenList,
+    };
 };
 
 /// TODO: Expand allowed codepoints to full Unicode range (for the time being it's ASCII only).
-pub fn tokenize(source: []const u8, allocator: mem.Allocator) ![]const Token {
+pub fn tokenize(allocator: mem.Allocator, source: []const u8) ![]const Token {
     var state = State{
-        .source = source,
-        .curr = .none,
-        .curr_start = 0,
-        .tokens = TokenList.initCapacity(allocator, source.len),
+        .in = source,
+        .mode = .none,
+        .start = null,
+        .out = try TokenList.initCapacity(allocator, source.len),
     };
 
-    for (source) |char, i| {
-        switch (state.curr) {
-            .hash => nextHash(&state, char, i),
-            .ampersand => nextAmpersand(&state, char, i),
-            .none => nextNone(&state, char, i),
-        }
+    for (state.in) |_, i| {
+        try switch (state.mode) {
+            .hash => nextHash(&state, i),
+            .ampersand => nextAmpersand(&state, i),
+            .minus => nextMinus(&state, i),
+            .underscore => nextUnderscore(&state, i),
+            .equal => nextEqual(&state, i),
+            .vertical_bar => nextVerticalBar(&state, i),
+            .semi_colon => nextSemiColon(&state, i),
+            .colon => nextColon(&state, i),
+            .period => nextPeriod(&state, i),
+            .dec_number => nextDecNumber(&state, i),
+            .hex_number => nextHexNumber(&state, i),
+            .oct_number => nextOctNumber(&state, i),
+            .bin_number => nextBinNumber(&state, i),
+            .string => nextString(&state, i),
+            .builtin => nextBuiltin(&state, i),
+            .identifier => nextIdentifier(&state, i),
+            .hash_identifier => nextHashIdentifier(&state, i),
+            .comment => nextComment(&state, i),
+            .doc_comment => nextDocComment(&state, i),
+            .invalid, .none => nextInvalidOrNone(&state, i),
+        };
     }
 
-    return state.tokens.toOwnedSlice();
+    if (state.mode == .none) {
+        return state.out.toOwnedSlice();
+    }
+
+    const last_char = state.in[state.in.len - 1];
+    const last_token_len = state.in.len - state.start.?;
+    switch (state.mode) {
+        .hash => try consumeStartToEnd(&state, .invalid),
+        .ampersand => try consumeStartToEnd(&state, .ampersand),
+        .minus => try consumeStartToEnd(&state, .minus),
+        .underscore => try consumeStartToEnd(&state, .underscore),
+        .equal => try consumeStartToEnd(&state, .equal),
+        .vertical_bar => try consumeStartToEnd(&state, .vertical_bar),
+        .semi_colon => try consumeStartToEnd(&state, .semi_colon),
+        .colon => try consumeStartToEnd(&state, .colon),
+        .period => try consumeStartToEnd(&state, .period),
+        .dec_number => {
+            if (isValidDecNumberEnd(last_char)) {
+                try consumeStartToEnd(&state, .dec_number);
+            } else {
+                try consumeStartToEnd(&state, .invalid);
+            }
+        },
+        .hex_number, .oct_number, .bin_number => {
+            if (isValidSpecialNumberEnd(last_char, last_token_len)) {
+                try consumeStartToEnd(
+                    &state,
+                    switch (state.mode) {
+                        .hex_number => .hex_number,
+                        .oct_number => .oct_number,
+                        .bin_number => .bin_number,
+                        else => unreachable,
+                    },
+                );
+            } else {
+                try consumeStartToEnd(&state, .invalid);
+            }
+        },
+        .string => try consumeStartToEnd(&state, .invalid),
+        .builtin => {
+            if (isValidBuiltinLen(last_token_len)) {
+                try consumeStartToEnd(&state, .builtin);
+            } else {
+                try consumeStartToEnd(&state, .invalid);
+            }
+        },
+        .identifier => try consumeStartToEnd(&state, .identifier),
+        .hash_identifier => try consumeStartToEnd(&state, .hash_identifier),
+        .comment => {
+            if (isValidCommentLen(last_token_len)) {
+                try consumeStartToEnd(&state, .comment);
+            } else {
+                try consumeStartToEnd(&state, .invalid);
+            }
+        },
+        .doc_comment => {
+            if (isValidDocCommentLen(last_token_len)) {
+                try consumeStartToEnd(&state, .doc_comment);
+            } else {
+                try consumeStartToEnd(&state, .invalid);
+            }
+        },
+        .invalid => try consumeStartToEnd(&state, .invalid),
+        .none => unreachable,
+    }
+
+    return state.out.toOwnedSlice();
 }
 
-inline fn nextHash(state: *State, char: u8, i: usize) void {
-    switch (char) {
-        '?' => {
-            try appendCurrIncl(state, .hash_question_mark, i);
-            state.curr = .none;
-        },
-        'A'...'Z', 'a'...'z' => {
-            state.curr = .hash_identifier;
-        },
-        _ => {
-            try appendCurrExcl(state, .invalid, i);
-            state.curr = .none;
-            nextNone(state, char, i);
-        },
+inline fn nextHash(state: *State, i: usize) !void {
+    const char = state.in[i];
+    if (char == '?') {
+        try consumeStartIncl(state, .hash_question_mark, i);
+    } else if (isValidIdentifierChar(char)) {
+        state.mode = .hash_identifier;
+    } else {
+        try consumeStartExcl(state, .invalid, i);
     }
 }
 
-inline fn nextAmpersand(state: *State, char: u8, i: usize) void {
-    switch (char) {
+inline fn nextAmpersand(state: *State, i: usize) !void {
+    switch (state.in[i]) {
         '{' => {
-            try appendCurrIncl(state, .ampersand_left_curly, i);
-            state = .none;
+            try consumeStartIncl(state, .ampersand_left_curly, i);
         },
-        _ => {
-            try appendCurrExcl(state, .ampersand, i);
-            state = .none;
-            nextNone(state, char, i);
+        else => {
+            try consumeStartExcl(state, .ampersand, i);
         },
     }
 }
 
-inline fn nextMinus(state: *State, char: u8, i: usize) void {
-    switch (char) {
+inline fn nextMinus(state: *State, i: usize) !void {
+    switch (state.in[i]) {
         '-' => {
-            try appendCurrIncl(state, .minus_minus, i);
-            state.curr = .none;
+            try consumeStartIncl(state, .minus_minus, i);
         },
-        _ => {
-            try appendCurrExcl(state, .minus, i);
-            state = .none;
-            nextNone(state, char, i);
+        else => {
+            try consumeStartExcl(state, .minus, i);
         },
     }
 }
 
-inline fn nextUnderscore(state: *State, char: u8, i: usize) void {
-    switch (char) {
+inline fn nextUnderscore(state: *State, i: usize) !void {
+    switch (state.in[i]) {
         'A'...'Z', 'a'...'z' => {
-            state.curr = .identifier;
+            state.mode = .identifier;
         },
-        _ => {
-            try appendCurrExcl(state, .underscore, i);
-            state = .none;
-            nextNone(state, char, i);
+        else => {
+            try consumeStartExcl(state, .underscore, i);
         },
     }
 }
 
-inline fn nextEqual(state: *State, char: u8, i: usize) void {
-    switch (char) {
+inline fn nextEqual(state: *State, i: usize) !void {
+    switch (state.in[i]) {
         '>' => {
-            try appendCurrIncl(state, .equal_greater_than, i);
-            state = .none;
+            try consumeStartIncl(state, .equal_greater_than, i);
         },
-        _ => {
-            try appendCurrExcl(state, .equal, i);
-            state = .none;
-            nextNone(state, char, i);
+        else => {
+            try consumeStartExcl(state, .equal, i);
         },
     }
 }
 
-inline fn nextVerticalBar(state: *State, char: u8, i: usize) void {
-    switch (char) {
+inline fn nextVerticalBar(state: *State, i: usize) !void {
+    switch (state.in[i]) {
         '{' => {
-            try appendCurrIncl(state, .vertical_bar_left_curly, i);
-            state = .none;
+            try consumeStartIncl(state, .vertical_bar_left_curly, i);
         },
-        _ => {
-            try appendCurrExcl(state, .vertical_bar, i);
-            state = .none;
-            nextNone(state, char, i);
+        else => {
+            try consumeStartExcl(state, .vertical_bar, i);
         },
     }
 }
 
-inline fn nextSemiColon(state: *State, char: u8, i: usize) void {
-    switch (char) {
+inline fn nextSemiColon(state: *State, i: usize) !void {
+    switch (state.in[i]) {
         '{' => {
-            try appendCurrIncl(state, .semi_colon_left_curly, i);
-            state = .none;
+            try consumeStartIncl(state, .semi_colon_left_curly, i);
+        },
+        else => {
+            try consumeStartExcl(state, .semi_colon, i);
         },
     }
 }
 
-fn nextNone(state: *State, char: u8, i: usize) void {
-    switch (char) {
-        '`' => try appendAt(&state, .tick, i),
-        '~' => try appendAt(&state, .tilde, i),
-        '!' => try appendAt(&state, .exclamation, i),
-        '@' => {
-            state.curr = .builtin;
-            state.curr_start = i;
-        },
-        '#' => {
-            state.curr = .hash;
-            state.curr_start = i;
-        },
-        '$' => try appendAt(&state, .dollar, i),
-        '%' => try appendAt(&state, .percent, i),
-        '^' => try appendAt(&state, .caret, i),
-        '&' => {
-            state.curr = .ampersand;
-            state.curr_start = i;
-        },
-        '*' => try appendAt(&state, .asterisk, i),
-        '(' => try appendAt(&state, .left_paren, i),
-        ')' => try appendAt(&state, .right_paren, i),
-        '-' => {
-            state.curr = .minus;
-            state.curr_start = i;
-        },
-        '_' => {
-            state.curr = .underscore;
-            state.curr_start = 1;
+inline fn nextColon(state: *State, i: usize) !void {
+    switch (state.in[i]) {
+        ':' => {
+            try consumeStartIncl(state, .colon_colon, i);
         },
         '=' => {
-            state.curr = .equal;
-            state.curr_start = i;
+            try consumeStartIncl(state, .colon_equal, i);
         },
-        '+' => try appendAt(&state, .plus, i),
-        '[' => try appendAt(&state, .left_square, i),
-        ']' => try appendAt(&state, .right_square, i),
-        '{' => try appendAt(&state, .left_curly, i),
-        '}' => try appendAt(&state, .right_curly, i),
-        '\\' => try appendAt(&state, .back_slash, i),
-        '|' => {
-            state.curr = .vertical_bar;
-            state.curr_start = i;
-        },
-        ';' => {
-            state.curr = .semi_colon;
-            state.curr_start = i;
-        },
-        ':' => {
-            state.curr = .colon;
-            state.curr_start = i;
-        },
-        '\'' => {
-            state.curr = .comment;
-            state.curr_start = i;
-        },
-        '"' => {
-            state.curr = .string;
-            state.curr_start = i;
-        },
-        ',' => try appendAt(&state, .comma, i),
-        '.' => {
-            state.curr = .period;
-            state.curr_start = i;
-        },
-        '<' => try appendAt(&state, .less_than, i),
-        '>' => try appendAt(&state, .greater_than, i),
-        '/' => try appendAt(&state, .forward_slash, i),
-        '?' => try appendAt(&state, .question_mark, i),
-        '0'...'9' => {
-            state.curr = .number;
-            state.curr_start = i;
-        },
-        'A'...'Z', 'a'...'z' => {
-            state.curr = .identifier;
-            state.curr_start = i;
-        },
-        '\n', '\t', '\r' => {
-            // ignore these characters
-        },
-        _ => {
-            // everything else is invalid
-            state.curr = .invalid;
-            state.curr_start = i;
+        else => {
+            try consumeStartExcl(state, .colon, i);
         },
     }
 }
 
-inline fn appendAt(state: *State, kind: Token.Kind, at: usize) !void {
-    try appendToken(state, kind, at, 1);
+inline fn nextPeriod(state: *State, i: usize) !void {
+    switch (state.in[i]) {
+        '.' => {
+            try consumeStartIncl(state, .period_period, i);
+        },
+        else => {
+            try consumeStartExcl(state, .period, i);
+        },
+    }
 }
 
-inline fn appendCurrIncl(state: *State, kind: Token.Kind, end: usize) !void {
-    try appendToken(state, kind, state.curr_start, end + 1);
+inline fn nextDecNumber(state: *State, i: usize) !void {
+    switch (state.in[i]) {
+        'x', 'o', 'b' => {
+            if (i != (state.start.? + 1)) {
+                try consumeStartIncl(state, .invalid, i);
+            } else switch (state.in[i]) {
+                'x' => {
+                    state.mode = .hex_number;
+                },
+                'o' => {
+                    state.mode = .oct_number;
+                },
+                'b' => {
+                    state.mode = .bin_number;
+                },
+                else => unreachable,
+            }
+        },
+        '0'...'9' => {
+            // valid, nothing to check for here
+        },
+        '_' => {
+            if (state.in[i - 1] == '_') {
+                try consumeStartIncl(state, .invalid, i);
+            }
+        },
+        else => {
+            if (isValidDecNumberEnd(state.in[i - 1])) {
+                try consumeStartExcl(state, .dec_number, i);
+            } else {
+                try consumeStartExcl(state, .invalid, i);
+            }
+        },
+    }
 }
 
-inline fn appendCurrExcl(state: *State, kind: Token.Kind, end: usize) !void {
-    try appendToken(state, kind, state.curr_start, end);
+inline fn isValidDecNumberEnd(char: u8) bool {
+    return char != '_';
+}
+
+inline fn nextHexNumber(state: *State, i: usize) !void {
+    switch (state.in[i]) {
+        '0'...'9', 'A'...'F', 'a'...'f' => {
+            // keep going to next char
+        },
+        '_' => {
+            switch (state.in[i - 1]) {
+                'x', '_' => {
+                    try consumeStartIncl(state, .invalid, i);
+                },
+                else => {
+                    // keep it going
+                },
+            }
+        },
+        else => {
+            if (isValidSpecialNumberEnd(state.in[i - 1], i - state.start.?)) {
+                try consumeStartExcl(state, .hex_number, i);
+            } else {
+                try consumeStartExcl(state, .invalid, i);
+            }
+        },
+    }
+}
+
+inline fn nextOctNumber(state: *State, i: usize) !void {
+    switch (state.in[i]) {
+        '0'...'7' => {
+            // keep going to next char
+        },
+        '_' => {
+            switch (state.in[i - 1]) {
+                'o', '_' => {
+                    try consumeStartIncl(state, .invalid, i);
+                },
+                else => {
+                    // keep it going
+                },
+            }
+        },
+        else => {
+            if (isValidSpecialNumberEnd(state.in[i - 1], i - state.start.?)) {
+                try consumeStartExcl(state, .oct_number, i);
+            } else {
+                try consumeStartExcl(state, .invalid, i);
+            }
+        },
+    }
+}
+
+inline fn nextBinNumber(state: *State, i: usize) !void {
+    switch (state.in[i]) {
+        '0', '1' => {
+            // keep going to next char
+        },
+        '_' => {
+            switch (state.in[i - 1]) {
+                'b', '_' => {
+                    try consumeStartIncl(state, .invalid, i);
+                },
+                else => {
+                    // keep it going
+                },
+            }
+        },
+        else => {
+            if (isValidSpecialNumberEnd(state.in[i - 1], i - state.start.?)) {
+                try consumeStartExcl(state, .bin_number, i);
+            } else {
+                try consumeStartExcl(state, .invalid, i);
+            }
+        },
+    }
+}
+
+inline fn isValidSpecialNumberEnd(char: u8, token_len: usize) bool {
+    if (token_len < 3)
+        return false;
+
+    return char != '_';
+}
+
+inline fn nextString(state: *State, i: usize) !void {
+    switch (state.in[i]) {
+        '"' => if (state.in[i - 1] != '\\') {
+            // this is an unescaped closing quote
+            try consumeStartIncl(state, .string, i);
+        },
+        '\n' => {
+            // a newline char was reached before the closing quote which is invalid
+            try consumeStartIncl(state, .invalid, i);
+        },
+        else => {
+            // TODO: everything else valid?
+        },
+    }
+}
+
+inline fn nextBuiltin(state: *State, i: usize) !void {
+    switch (state.in[i]) {
+        'A'...'Z', 'a'...'z', '0'...'9', '_' => {
+            // keep it going
+        },
+        else => {
+            if (isValidBuiltinLen(i - state.start.?)) {
+                try consumeStartExcl(state, .builtin, i);
+            } else {
+                try consumeStartExcl(state, .invalid, i);
+            }
+        },
+    }
+}
+
+inline fn isValidBuiltinLen(len: usize) bool {
+    return len >= 2;
+}
+
+inline fn nextIdentifier(state: *State, i: usize) !void {
+    if (!isValidIdentifierChar(state.in[i])) {
+        try consumeStartExcl(state, .identifier, i);
+    }
+}
+
+inline fn nextHashIdentifier(state: *State, i: usize) !void {
+    if (!isValidIdentifierChar(state.in[i])) {
+        try consumeStartExcl(state, .hash_identifier, i);
+    }
+}
+
+inline fn isValidIdentifierChar(char: u8) bool {
+    return switch (char) {
+        'A'...'Z', 'a'...'z', '0'...'9', '_' => true,
+        else => false,
+    };
+}
+
+inline fn nextComment(state: *State, i: usize) !void {
+    switch (state.in[i]) {
+        '\'' => {
+            if (i == (state.start.? + 1)) {
+                state.mode = .doc_comment;
+            }
+        },
+        '\n' => {
+            if (isValidCommentLen(i - state.start.?)) {
+                try consumeStartExcl(state, .comment, i);
+            } else {
+                try consumeStartExcl(state, .invalid, i);
+            }
+        },
+        else => {
+            // everything else valid
+        },
+    }
+}
+
+inline fn isValidCommentLen(len: usize) bool {
+    return len >= 2;
+}
+
+inline fn nextDocComment(state: *State, i: usize) !void {
+    switch (state.in[i]) {
+        '\n' => {
+            if (isValidDocCommentLen(i - state.start.?)) {
+                try consumeStartExcl(state, .doc_comment, i);
+            } else {
+                try consumeStartExcl(state, .invalid, i);
+            }
+        },
+        else => {
+            // everything else valid
+        },
+    }
+}
+
+inline fn isValidDocCommentLen(len: usize) bool {
+    return len >= 3;
+}
+
+fn nextInvalidOrNone(state: *State, i: usize) !void {
+    var new_mode: ?State.Mode = null;
+    var new_token: ?Token.Kind = null;
+    switch (state.in[i]) {
+        '`' => new_token = .tick,
+        '~' => new_token = .tilde,
+        '!' => new_token = .exclamation,
+        '@' => new_mode = .builtin,
+        '#' => new_mode = .hash,
+        '$' => new_token = .dollar,
+        '%' => new_token = .percent,
+        '^' => new_token = .caret,
+        '&' => new_mode = .ampersand,
+        '*' => new_token = .asterisk,
+        '(' => new_token = .left_paren,
+        ')' => new_token = .right_paren,
+        '-' => new_mode = .minus,
+        '_' => new_mode = .underscore,
+        '=' => new_mode = .equal,
+        '+' => new_token = .plus,
+        '[' => new_token = .left_square,
+        ']' => new_token = .right_square,
+        '{' => new_token = .left_curly,
+        '}' => new_token = .right_curly,
+        '\\' => new_token = .back_slash,
+        '|' => new_mode = .vertical_bar,
+        ';' => new_mode = .semi_colon,
+        ':' => new_mode = .colon,
+        '\'' => new_mode = .comment,
+        '"' => new_mode = .string,
+        ',' => new_token = .comma,
+        '.' => new_mode = .period,
+        '<' => new_token = .less_than,
+        '>' => new_token = .greater_than,
+        '/' => new_token = .forward_slash,
+        '?' => new_token = .question_mark,
+        '0'...'9' => new_mode = .dec_number,
+        'A'...'Z', 'a'...'z' => new_mode = .identifier,
+        ' ', '\n', '\t', '\r' => new_mode = .none,
+        else => new_mode = .invalid,
+    }
+
+    const old_mode = state.mode;
+    const old_start = state.start;
+
+    if (new_mode) |nm| {
+        if (nm != old_mode) {
+            state.mode = nm;
+            state.start = i;
+        } else if (old_mode == .invalid) {
+            return;
+        }
+    } else if (new_token) |nt| {
+        try appendToken(state, nt, i, i + 1);
+        state.mode = .none;
+    }
+
+    if (old_mode == .invalid) {
+        try appendToken(state, .invalid, old_start.?, i);
+    }
+}
+
+inline fn consumeStartIncl(state: *State, kind: Token.Kind, i: usize) !void {
+    try appendToken(state, kind, state.start.?, i + 1);
+    state.mode = .none;
+    state.start = null;
+}
+
+inline fn consumeStartExcl(state: *State, kind: Token.Kind, i: usize) !void {
+    try appendToken(state, kind, state.start.?, i);
+    state.mode = .none;
+    state.start = null;
+    // the char at `i` wasn't consumed so we still have to process it.
+    try nextInvalidOrNone(state, i);
+}
+
+inline fn consumeStartToEnd(state: *State, kind: Token.Kind) !void {
+    try appendToken(state, kind, state.start.?, state.in.len);
 }
 
 inline fn appendToken(state: *State, kind: Token.Kind, start: usize, end: usize) !void {
-    if (end <= start) {
+    if (!(end > start)) {
         @panic("appendToken received an `end` value that was not greater than `start`");
     }
-    try state.tokens.append(Token{
+    try state.out.append(Token{
         .kind = kind,
         .start = start,
         .len = end - start,
-        .raw = state.source[start..end],
+        .raw = state.in[start..end],
     });
+}
+
+test "single character symbols" {
+    try expectTokens("`", &.{.tick});
+    try expectTokens("~", &.{.tilde});
+    try expectTokens("!", &.{.exclamation});
+    try expectTokens("@", &.{.invalid});
+    try expectTokens("#", &.{.invalid});
+    try expectTokens("$", &.{.dollar});
+    try expectTokens("%", &.{.percent});
+    try expectTokens("^", &.{.caret});
+    try expectTokens("&", &.{.ampersand});
+    try expectTokens("*", &.{.asterisk});
+    try expectTokens("(", &.{.left_paren});
+    try expectTokens(")", &.{.right_paren});
+    try expectTokens("-", &.{.minus});
+    try expectTokens("_", &.{.underscore});
+    try expectTokens("=", &.{.equal});
+    try expectTokens("+", &.{.plus});
+    try expectTokens("[", &.{.left_square});
+    try expectTokens("]", &.{.right_square});
+    try expectTokens("{", &.{.left_curly});
+    try expectTokens("}", &.{.right_curly});
+    try expectTokens("\\", &.{.back_slash});
+    try expectTokens("|", &.{.vertical_bar});
+    try expectTokens(";", &.{.semi_colon});
+    try expectTokens(":", &.{.colon});
+    try expectTokens("'", &.{.invalid});
+    try expectTokens("\"", &.{.invalid});
+    try expectTokens(",", &.{.comma});
+    try expectTokens(".", &.{.period});
+    try expectTokens("<", &.{.less_than});
+    try expectTokens(">", &.{.greater_than});
+    try expectTokens("/", &.{.forward_slash});
+    try expectTokens("?", &.{.question_mark});
+}
+
+test "tokenizer golden" {
+    try expectLines(.{
+        .{ "'' Classic hello world program", &.{.doc_comment} },
+        .{ ":= --::std", &.{ .colon_equal, .minus_minus, .colon_colon, .identifier } },
+        .{ "", &.{} },
+        .{ "-- main := () {", &.{ .minus_minus, .identifier, .colon_equal, .left_paren, .right_paren, .left_curly } },
+        .{ "    ' this isn't an actual std lib function", &.{.comment} },
+        .{ "    @print(\"Hello world\")", &.{ .builtin, .left_paren, .string, .right_paren } },
+        .{ "}", &.{.right_curly} },
+    });
+}
+
+const print = std.debug.print;
+const testing = std.testing;
+fn expectTokens(source: []const u8, expected: []const Token.Kind) !void {
+    const tokens = try tokenize(testing.allocator, source);
+    defer testing.allocator.free(tokens);
+
+    testing.expectEqual(tokens.len, expected.len) catch {
+        print("expectTokens tokens.len != expected.len", .{});
+        unreachable;
+    };
+
+    for (tokens) |token, i| {
+        testing.expectEqual(token.kind, expected[i]) catch {
+            print("expectTokens token.kind != expected[i]; {} != {}", .{ token.kind, expected[i] });
+            unreachable;
+        };
+    }
+}
+
+fn expectLines(lines: anytype) !void {
+    var source = try std.ArrayList(u8).initCapacity(testing.allocator, lines.len * 4);
+    defer source.deinit();
+
+    var expected = try std.ArrayList(Token.Kind).initCapacity(testing.allocator, lines.len * 2);
+    defer expected.deinit();
+
+    inline for (lines) |line| {
+        try source.appendSlice(line[0]);
+        try source.append('\n');
+        try expected.appendSlice(line[1]);
+    }
+
+    try expectTokens(source.items, expected.items);
 }
