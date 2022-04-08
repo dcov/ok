@@ -7,7 +7,7 @@ pub const Token = struct {
     len: usize,
     raw: []const u8,
     line: usize,
-    offset: usize,
+    line_offset: usize,
 
     pub const Kind = enum {
         // single symbol tokens
@@ -113,7 +113,9 @@ pub fn tokenize(allocator: mem.Allocator, source: []const u8) ![]const Token {
         .in = source,
         .mode = .none,
         .start = null,
-        .out = try TokenList.initCapacity(allocator, source.len),
+        .out = try TokenList.initCapacity(allocator, source.len / 8),
+        .line = 1,
+        .line_start = 0,
     };
 
     for (state.in) |_, i| {
@@ -534,6 +536,7 @@ inline fn isValidDocCommentLen(len: usize) bool {
 fn nextInvalidOrNone(state: *State, i: usize) !void {
     var new_mode: ?State.Mode = null;
     var new_token: ?Token.Kind = null;
+    var new_line: bool = false;
     switch (state.in[i]) {
         '`' => new_token = .tick,
         '~' => new_token = .tilde,
@@ -569,7 +572,11 @@ fn nextInvalidOrNone(state: *State, i: usize) !void {
         '?' => new_token = .question_mark,
         '0'...'9' => new_mode = .dec_number,
         'A'...'Z', 'a'...'z' => new_mode = .identifier,
-        ' ', '\n', '\t', '\r' => new_mode = .none,
+        ' ', '\t' => new_mode = .none,
+        '\n', '\r' => {
+            new_mode = .none;
+            new_line = true;
+        },
         else => new_mode = .invalid,
     }
 
@@ -590,6 +597,11 @@ fn nextInvalidOrNone(state: *State, i: usize) !void {
 
     if (old_mode == .invalid) {
         try appendToken(state, .invalid, old_start.?, i);
+    }
+
+    if (new_line) {
+        state.line += 1;
+        state.line_start = i + 1;
     }
 }
 
@@ -615,15 +627,22 @@ inline fn appendToken(state: *State, kind: Token.Kind, start: usize, end: usize)
     if (!(end > start)) {
         @panic("appendToken received an `end` value that was not greater than `start`");
     }
+    if (!(start >= state.line_start)) {
+        @panic("appendToken recieved a `start` value that was less than `state.line_start`");
+    }
     try state.out.append(Token{
         .kind = kind,
         .start = start,
         .len = end - start,
         .raw = state.in[start..end],
+        .line = state.line,
+        .line_offset = start - state.line_start,
     });
 }
 
-test "single character symbols" {
+// not all of the symbols have been assigned, but they are still reserved by the language so we make sure here that the
+// tokenizer can handle them, because not all of them will show up in the 'comprehensive' test.
+test "all symbols" {
     try expectTokens("`", &.{.tick});
     try expectTokens("~", &.{.tilde});
     try expectTokens("!", &.{.exclamation});
@@ -658,16 +677,50 @@ test "single character symbols" {
     try expectTokens("?", &.{.question_mark});
 }
 
-test "tokenizer golden" {
-    try expectLines(.{
-        .{ "'' Classic hello world program", &.{.doc_comment} },
-        .{ ":= --::std", &.{ .colon_equal, .minus_minus, .colon_colon, .identifier } },
-        .{ "", &.{} },
-        .{ "-- main := () {", &.{ .minus_minus, .identifier, .colon_equal, .left_paren, .right_paren, .left_curly } },
-        .{ "    ' this isn't an actual std lib function", &.{.comment} },
-        .{ "    @print(\"Hello world\")", &.{ .builtin, .left_paren, .string, .right_paren } },
-        .{ "}", &.{.right_curly} },
-    });
+test "comprehensive" {
+    const source =
+        \\'' Comprehensive source that includes all current language features
+        \\
+        \\:= --::std
+        \\:= -::json
+        \\:= _::commands
+        \\
+        \\-- ServiceConfig := &{
+        \\    -- endpoint: @str,
+        \\}
+        \\
+        \\-- system := (enabled: @bool, config: ServiceConfig) {
+        \\    ' builtin print
+        \\    @print("Hello World")
+        \\}
+    ;
+
+    const expected = &.{
+        .doc_comment,
+
+        .colon_equal,
+        .minus_minus,
+        .colon_colon,
+        .identifier,
+
+        .minus_minus,
+        .identifier,
+        .colon_equal,
+        .left_parent,
+        .right_paren,
+        .left_curly,
+
+        .comment,
+
+        .builtin,
+        .left_paren,
+        .string,
+        .right_paren,
+
+        .right_curly,
+    };
+
+    try expectTokens(source, expected);
 }
 
 const print = std.debug.print;
@@ -683,24 +736,13 @@ fn expectTokens(source: []const u8, expected: []const Token.Kind) !void {
 
     for (tokens) |token, i| {
         testing.expectEqual(token.kind, expected[i]) catch {
-            print("expectTokens token.kind != expected[i]; {} != {}", .{ token.kind, expected[i] });
+            print("\nexpectTokens()\nexpected: {s},\ngot: {s} at line {d} col {d}\n\n", .{
+                @tagName(expected[i]),
+                @tagName(token.kind),
+                token.line,
+                token.line_offset,
+            });
             unreachable;
         };
     }
-}
-
-fn expectLines(lines: anytype) !void {
-    var source = try std.ArrayList(u8).initCapacity(testing.allocator, lines.len * 4);
-    defer source.deinit();
-
-    var expected = try std.ArrayList(Token.Kind).initCapacity(testing.allocator, lines.len * 2);
-    defer expected.deinit();
-
-    inline for (lines) |line| {
-        try source.appendSlice(line[0]);
-        try source.append('\n');
-        try expected.appendSlice(line[1]);
-    }
-
-    try expectTokens(source.items, expected.items);
 }
