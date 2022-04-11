@@ -10,13 +10,9 @@ pub const Token = struct {
     line_offset: usize,
 
     pub const Kind = enum {
-        // single symbol tokens
-        tick,
-        tilde,
-        exclamation,
-        dollar,
+        // symbols
+        hash,
         percent,
-        caret,
         ampersand,
         asterisk,
         left_paren,
@@ -24,49 +20,29 @@ pub const Token = struct {
         minus,
         underscore,
         equal,
-        plus,
         left_square,
         right_square,
         left_curly,
         right_curly,
-        back_slash,
         vertical_bar,
         semi_colon,
         colon,
         comma,
         period,
-        less_than,
         greater_than,
-        forward_slash,
         question_mark,
 
-        // multiple symbol tokens
-        hash_question_mark,
-        ampersand_left_curly,
-        minus_minus,
-        minus_greater_than,
-        equal_greater_than,
-        vertical_bar_left_curly,
-        semi_colon_left_curly,
-        colon_colon,
-        colon_equal,
-        period_period,
-
-        // literal tokens
+        // alphanumeric
         dec_number,
         hex_number,
         oct_number,
         bin_number,
-        string,
-
-        // identifier tokens
-        builtin,
         identifier,
-        hash_identifier,
 
-        // comment tokens
+        // mixed
+        string,
+        builtin,
         comment,
-        doc_comment,
 
         invalid,
     };
@@ -75,412 +51,294 @@ pub const Token = struct {
 const TokenList = std.ArrayList(Token);
 
 const State = struct {
-    in: []const u8,
-    mode: Mode,
-    start: ?usize,
-    out: TokenList,
+    source: []const u8,
     line: usize,
     line_start: usize,
+    mode: ?Mode,
+    mode_start: ?usize,
+    tokens: TokenList,
 
     const Mode = enum {
-        hash,
-        ampersand,
-        minus,
-        underscore,
-        equal,
-        vertical_bar,
-        semi_colon,
-        colon,
-        period,
+        builtin,
+        comment,
+        string,
+        identifier,
         dec_number,
         hex_number,
         oct_number,
         bin_number,
-        string,
-        builtin,
-        identifier,
-        hash_identifier,
-        comment,
-        doc_comment,
-        invalid,
-        none,
+
+        underscore,
     };
 };
 
 /// TODO: Expand allowed codepoints to full Unicode range (for the time being it's ASCII only).
 pub fn tokenize(allocator: mem.Allocator, source: []const u8) ![]const Token {
     var state = State{
-        .in = source,
-        .mode = .none,
-        .start = null,
-        .out = try TokenList.initCapacity(allocator, source.len / 8),
-        .line = 1,
+        .source = source,
+        .line = 0,
         .line_start = 0,
+        .mode = null,
+        .mode_start = null,
+        .tokens = try TokenList.initCapacity(allocator, source.len / 8),
     };
 
-    for (state.in) |_, i| {
-        try switch (state.mode) {
-            .hash => nextHash(&state, i),
-            .ampersand => nextAmpersand(&state, i),
-            .minus => nextMinus(&state, i),
-            .underscore => nextUnderscore(&state, i),
-            .equal => nextEqual(&state, i),
-            .vertical_bar => nextVerticalBar(&state, i),
-            .semi_colon => nextSemiColon(&state, i),
-            .colon => nextColon(&state, i),
-            .period => nextPeriod(&state, i),
-            .dec_number => nextDecNumber(&state, i),
-            .hex_number => nextHexNumber(&state, i),
-            .oct_number => nextOctNumber(&state, i),
-            .bin_number => nextBinNumber(&state, i),
-            .string => nextString(&state, i),
-            .builtin => nextBuiltin(&state, i),
-            .identifier => nextIdentifier(&state, i),
-            .hash_identifier => nextHashIdentifier(&state, i),
-            .comment => nextComment(&state, i),
-            .doc_comment => nextDocComment(&state, i),
-            .invalid, .none => nextInvalidOrNone(&state, i),
-        };
-    }
-
-    if (state.mode == .none) {
-        return state.out.toOwnedSlice();
-    }
-
-    const last_char = state.in[state.in.len - 1];
-    const last_token_len = state.in.len - state.start.?;
-    switch (state.mode) {
-        .hash => try consumeStartToEnd(&state, .invalid),
-        .ampersand => try consumeStartToEnd(&state, .ampersand),
-        .minus => try consumeStartToEnd(&state, .minus),
-        .underscore => try consumeStartToEnd(&state, .underscore),
-        .equal => try consumeStartToEnd(&state, .equal),
-        .vertical_bar => try consumeStartToEnd(&state, .vertical_bar),
-        .semi_colon => try consumeStartToEnd(&state, .semi_colon),
-        .colon => try consumeStartToEnd(&state, .colon),
-        .period => try consumeStartToEnd(&state, .period),
-        .dec_number => {
-            if (isValidDecNumberEnd(last_char)) {
-                try consumeStartToEnd(&state, .dec_number);
-            } else {
-                try consumeStartToEnd(&state, .invalid);
-            }
-        },
-        .hex_number, .oct_number, .bin_number => {
-            if (isValidSpecialNumberEnd(last_char, last_token_len)) {
-                try consumeStartToEnd(
-                    &state,
-                    switch (state.mode) {
-                        .hex_number => .hex_number,
-                        .oct_number => .oct_number,
-                        .bin_number => .bin_number,
-                        else => unreachable,
+    for (state.source) |char, i| {
+        if (state.mode) |mode| {
+            const start = state.mode_start.?;
+            const prev_char = state.source[i - 1];
+            switch (mode) {
+                .builtin => if (isValidIdentifierChar(char))
+                    continue
+                else
+                    try finalize(
+                        &state,
+                        if (!(i - start > 1))
+                            .invalid
+                        else
+                            .builtin,
+                        i,
+                    ),
+                .comment => switch (char) {
+                    '\r', '\n' => {
+                        try finalize(&state, .comment, i);
                     },
-                );
-            } else {
-                try consumeStartToEnd(&state, .invalid);
-            }
-        },
-        .string => try consumeStartToEnd(&state, .invalid),
-        .builtin => {
-            if (isValidBuiltinLen(last_token_len)) {
-                try consumeStartToEnd(&state, .builtin);
-            } else {
-                try consumeStartToEnd(&state, .invalid);
-            }
-        },
-        .identifier => try consumeStartToEnd(&state, .identifier),
-        .hash_identifier => try consumeStartToEnd(&state, .hash_identifier),
-        .comment => {
-            if (isValidCommentLen(last_token_len)) {
-                try consumeStartToEnd(&state, .comment);
-            } else {
-                try consumeStartToEnd(&state, .invalid);
-            }
-        },
-        .doc_comment => {
-            if (isValidDocCommentLen(last_token_len)) {
-                try consumeStartToEnd(&state, .doc_comment);
-            } else {
-                try consumeStartToEnd(&state, .invalid);
-            }
-        },
-        .invalid => try consumeStartToEnd(&state, .invalid),
-        .none => unreachable,
-    }
-
-    return state.out.toOwnedSlice();
-}
-
-inline fn nextHash(state: *State, i: usize) !void {
-    const char = state.in[i];
-    if (char == '?') {
-        try consumeStartIncl(state, .hash_question_mark, i);
-    } else if (isValidIdentifierChar(char)) {
-        state.mode = .hash_identifier;
-    } else {
-        try consumeStartExcl(state, .invalid, i);
-    }
-}
-
-inline fn nextAmpersand(state: *State, i: usize) !void {
-    switch (state.in[i]) {
-        '{' => {
-            try consumeStartIncl(state, .ampersand_left_curly, i);
-        },
-        else => {
-            try consumeStartExcl(state, .ampersand, i);
-        },
-    }
-}
-
-inline fn nextMinus(state: *State, i: usize) !void {
-    switch (state.in[i]) {
-        '-' => {
-            try consumeStartIncl(state, .minus_minus, i);
-        },
-        else => {
-            try consumeStartExcl(state, .minus, i);
-        },
-    }
-}
-
-inline fn nextUnderscore(state: *State, i: usize) !void {
-    switch (state.in[i]) {
-        'A'...'Z', 'a'...'z' => {
-            state.mode = .identifier;
-        },
-        else => {
-            try consumeStartExcl(state, .underscore, i);
-        },
-    }
-}
-
-inline fn nextEqual(state: *State, i: usize) !void {
-    switch (state.in[i]) {
-        '>' => {
-            try consumeStartIncl(state, .equal_greater_than, i);
-        },
-        else => {
-            try consumeStartExcl(state, .equal, i);
-        },
-    }
-}
-
-inline fn nextVerticalBar(state: *State, i: usize) !void {
-    switch (state.in[i]) {
-        '{' => {
-            try consumeStartIncl(state, .vertical_bar_left_curly, i);
-        },
-        else => {
-            try consumeStartExcl(state, .vertical_bar, i);
-        },
-    }
-}
-
-inline fn nextSemiColon(state: *State, i: usize) !void {
-    switch (state.in[i]) {
-        '{' => {
-            try consumeStartIncl(state, .semi_colon_left_curly, i);
-        },
-        else => {
-            try consumeStartExcl(state, .semi_colon, i);
-        },
-    }
-}
-
-inline fn nextColon(state: *State, i: usize) !void {
-    switch (state.in[i]) {
-        ':' => {
-            try consumeStartIncl(state, .colon_colon, i);
-        },
-        '=' => {
-            try consumeStartIncl(state, .colon_equal, i);
-        },
-        else => {
-            try consumeStartExcl(state, .colon, i);
-        },
-    }
-}
-
-inline fn nextPeriod(state: *State, i: usize) !void {
-    switch (state.in[i]) {
-        '.' => {
-            try consumeStartIncl(state, .period_period, i);
-        },
-        else => {
-            try consumeStartExcl(state, .period, i);
-        },
-    }
-}
-
-inline fn nextDecNumber(state: *State, i: usize) !void {
-    switch (state.in[i]) {
-        'x', 'o', 'b' => {
-            if (i != (state.start.? + 1)) {
-                try consumeStartIncl(state, .invalid, i);
-            } else switch (state.in[i]) {
-                'x' => {
-                    state.mode = .hex_number;
+                    else => continue,
                 },
-                'o' => {
-                    state.mode = .oct_number;
+                .string => switch (char) {
+                    '"' => {
+                        if (prev_char != '\\') {
+                            try finalize(&state, .string, i + 1);
+                        }
+                        continue;
+                    },
+                    '\r', '\n' => {
+                        try finalize(&state, .invalid, i);
+                    },
+                    else => continue,
                 },
-                'b' => {
-                    state.mode = .bin_number;
-                },
-                else => unreachable,
-            }
-        },
-        '0'...'9' => {
-            // valid, nothing to check for here
-        },
-        '_' => {
-            if (state.in[i - 1] == '_') {
-                try consumeStartIncl(state, .invalid, i);
-            }
-        },
-        else => {
-            if (isValidDecNumberEnd(state.in[i - 1])) {
-                try consumeStartExcl(state, .dec_number, i);
-            } else {
-                try consumeStartExcl(state, .invalid, i);
-            }
-        },
-    }
-}
+                .identifier => if (isValidIdentifierChar(char)) continue else try finalize(&state, .identifier, i),
+                .dec_number => {
+                    if (i == start + 1) {
+                        switch (char) {
+                            'x' => {
+                                state.mode = .hex_number;
+                                continue;
+                            },
+                            'o' => {
+                                state.mode = .oct_number;
+                                continue;
+                            },
+                            'b' => {
+                                state.mode = .bin_number;
+                                continue;
+                            },
+                            else => {},
+                        }
+                    }
 
-inline fn isValidDecNumberEnd(char: u8) bool {
-    return char != '_';
-}
-
-inline fn nextHexNumber(state: *State, i: usize) !void {
-    switch (state.in[i]) {
-        '0'...'9', 'A'...'F', 'a'...'f' => {
-            // keep going to next char
-        },
-        '_' => {
-            switch (state.in[i - 1]) {
-                'x', '_' => {
-                    try consumeStartIncl(state, .invalid, i);
+                    switch (char) {
+                        '0'...'9' => continue,
+                        '_' => {
+                            if (prev_char == '_') {
+                                try finalize(&state, .invalid, i + 1);
+                            }
+                            continue;
+                        },
+                        else => try finalize(
+                            &state,
+                            if (prev_char == '_')
+                                .invalid
+                            else
+                                .dec_number,
+                            i,
+                        ),
+                    }
                 },
-                else => {
-                    // keep it going
+                .hex_number => {
+                    const prev_char_not_number = prev_char == '_' or prev_char == 'x';
+                    switch (char) {
+                        '0'...'9', 'A'...'F', 'a'...'f' => continue,
+                        '_' => {
+                            if (prev_char_not_number) {
+                                try finalize(&state, .invalid, i + 1);
+                            }
+                            continue;
+                        },
+                        else => try finalize(
+                            &state,
+                            if (prev_char_not_number)
+                                .invalid
+                            else
+                                .hex_number,
+                            i,
+                        ),
+                    }
+                },
+                .oct_number => {
+                    const prev_char_not_number = prev_char == '_' or prev_char == 'o';
+                    switch (char) {
+                        '0'...'7' => continue,
+                        '_' => {
+                            if (prev_char_not_number) {
+                                try finalize(&state, .invalid, i + 1);
+                            }
+                            continue;
+                        },
+                        else => try finalize(
+                            &state,
+                            if (prev_char_not_number)
+                                .invalid
+                            else
+                                .oct_number,
+                            i,
+                        ),
+                    }
+                },
+                .bin_number => {
+                    const prev_char_not_number = prev_char == '_' or prev_char == 'b';
+                    switch (char) {
+                        '0', '1' => continue,
+                        '_' => {
+                            if (prev_char_not_number) {
+                                try finalize(&state, .invalid, i + 1);
+                            }
+                            continue;
+                        },
+                        else => try finalize(
+                            &state,
+                            if (prev_char_not_number)
+                                .invalid
+                            else
+                                .bin_number,
+                            i,
+                        ),
+                    }
+                },
+                .underscore => switch (char) {
+                    'A'...'Z', 'a'...'z', '0'...'9', '_' => {
+                        state.mode = .identifier;
+                        continue;
+                    },
+                    // consume the previous character (i.e. the underscore character)
+                    else => try finalize(&state, .underscore, i),
                 },
             }
-        },
-        else => {
-            if (isValidSpecialNumberEnd(state.in[i - 1], i - state.start.?)) {
-                try consumeStartExcl(state, .hex_number, i);
-            } else {
-                try consumeStartExcl(state, .invalid, i);
-            }
-        },
+        }
+
+        if (state.mode != null) {
+            @panic("tokenize reached an invalid state where `mode` was unexpectedly not null");
+        }
+
+        // there was no `mode` or it was finalized without consuming the character,
+        // in either case we still need to process the current character.
+        switch (char) {
+            // invalid/reserved characters
+            '`', '~', '!', '$', '^', '+', '\\', '<', '/' => try consume(&state, .invalid, i),
+
+            // single symbol token characters
+            '#' => try consume(&state, .hash, i),
+            '%' => try consume(&state, .percent, i),
+            '&' => try consume(&state, .ampersand, i),
+            '*' => try consume(&state, .asterisk, i),
+            '(' => try consume(&state, .left_paren, i),
+            ')' => try consume(&state, .right_paren, i),
+            '-' => try consume(&state, .minus, i),
+            '=' => try consume(&state, .equal, i),
+            '[' => try consume(&state, .left_square, i),
+            ']' => try consume(&state, .right_square, i),
+            '{' => try consume(&state, .left_curly, i),
+            '}' => try consume(&state, .right_curly, i),
+            '|' => try consume(&state, .vertical_bar, i),
+            ';' => try consume(&state, .semi_colon, i),
+            ':' => try consume(&state, .colon, i),
+            ',' => try consume(&state, .comma, i),
+            '.' => try consume(&state, .period, i),
+            '>' => try consume(&state, .greater_than, i),
+            '?' => try consume(&state, .question_mark, i),
+
+            // mode-setting characters
+            '@' => begin(&state, .builtin, i),
+            '\'' => begin(&state, .comment, i),
+            '"' => begin(&state, .string, i),
+            'A'...'Z', 'a'...'z' => begin(&state, .identifier, i),
+            '0'...'9' => begin(&state, .dec_number, i),
+            '_' => begin(&state, .underscore, i),
+
+            '\r', '\n' => {
+                state.line += 1;
+                state.line_start = i + 1;
+            },
+            // everything else is ignored
+            // TODO: clear this up if/when need be
+            else => {},
+        }
     }
-}
 
-inline fn nextOctNumber(state: *State, i: usize) !void {
-    switch (state.in[i]) {
-        '0'...'7' => {
-            // keep going to next char
-        },
-        '_' => {
-            switch (state.in[i - 1]) {
-                'o', '_' => {
-                    try consumeStartIncl(state, .invalid, i);
-                },
-                else => {
-                    // keep it going
-                },
-            }
-        },
-        else => {
-            if (isValidSpecialNumberEnd(state.in[i - 1], i - state.start.?)) {
-                try consumeStartExcl(state, .oct_number, i);
-            } else {
-                try consumeStartExcl(state, .invalid, i);
-            }
-        },
+    if (state.mode) |mode| {
+        const start = state.mode_start.?;
+        const end = state.source.len;
+        const len = end - start;
+        const last_char = state.source[end - 1];
+        switch (mode) {
+            .builtin => try finalize(
+                &state,
+                if (!(len > 1))
+                    .invalid
+                else
+                    .builtin,
+                end,
+            ),
+            .comment => try finalize(&state, .comment, end),
+            .string => try finalize(
+                &state,
+                if (!(len > 1) or (last_char != '"') or (state.source[end - 2] == '\\'))
+                    .invalid
+                else
+                    .string,
+                end,
+            ),
+            .identifier => try finalize(&state, .identifier, end),
+            .dec_number => try finalize(
+                &state,
+                if (last_char == '_')
+                    .invalid
+                else
+                    .dec_number,
+                end,
+            ),
+            .hex_number => try finalize(
+                &state,
+                if (last_char == 'x' or last_char == '_')
+                    .invalid
+                else
+                    .hex_number,
+                end,
+            ),
+            .oct_number => try finalize(
+                &state,
+                if (last_char == 'o' or last_char == '_')
+                    .invalid
+                else
+                    .oct_number,
+                end,
+            ),
+            .bin_number => try finalize(
+                &state,
+                if (last_char == 'b' or last_char == '_')
+                    .invalid
+                else
+                    .bin_number,
+                end,
+            ),
+            .underscore => if (len > 1)
+                @panic("tokenizer: reached end of source and mode was `underscore` but len was greater than 1.")
+            else
+                try consume(&state, .underscore, end - 1),
+        }
     }
-}
 
-inline fn nextBinNumber(state: *State, i: usize) !void {
-    switch (state.in[i]) {
-        '0', '1' => {
-            // keep going to next char
-        },
-        '_' => {
-            switch (state.in[i - 1]) {
-                'b', '_' => {
-                    try consumeStartIncl(state, .invalid, i);
-                },
-                else => {
-                    // keep it going
-                },
-            }
-        },
-        else => {
-            if (isValidSpecialNumberEnd(state.in[i - 1], i - state.start.?)) {
-                try consumeStartExcl(state, .bin_number, i);
-            } else {
-                try consumeStartExcl(state, .invalid, i);
-            }
-        },
-    }
-}
-
-inline fn isValidSpecialNumberEnd(char: u8, token_len: usize) bool {
-    if (token_len < 3)
-        return false;
-
-    return char != '_';
-}
-
-inline fn nextString(state: *State, i: usize) !void {
-    switch (state.in[i]) {
-        '"' => if (state.in[i - 1] != '\\') {
-            // this is an unescaped closing quote
-            try consumeStartIncl(state, .string, i);
-        },
-        '\n' => {
-            // a newline char was reached before the closing quote which is invalid
-            try consumeStartIncl(state, .invalid, i);
-        },
-        else => {
-            // TODO: everything else valid?
-        },
-    }
-}
-
-inline fn nextBuiltin(state: *State, i: usize) !void {
-    switch (state.in[i]) {
-        'A'...'Z', 'a'...'z', '0'...'9', '_' => {
-            // keep it going
-        },
-        else => {
-            if (isValidBuiltinLen(i - state.start.?)) {
-                try consumeStartExcl(state, .builtin, i);
-            } else {
-                try consumeStartExcl(state, .invalid, i);
-            }
-        },
-    }
-}
-
-inline fn isValidBuiltinLen(len: usize) bool {
-    return len >= 2;
-}
-
-inline fn nextIdentifier(state: *State, i: usize) !void {
-    if (!isValidIdentifierChar(state.in[i])) {
-        try consumeStartExcl(state, .identifier, i);
-    }
-}
-
-inline fn nextHashIdentifier(state: *State, i: usize) !void {
-    if (!isValidIdentifierChar(state.in[i])) {
-        try consumeStartExcl(state, .hash_identifier, i);
-    }
+    return state.tokens.toOwnedSlice();
 }
 
 inline fn isValidIdentifierChar(char: u8) bool {
@@ -490,137 +348,22 @@ inline fn isValidIdentifierChar(char: u8) bool {
     };
 }
 
-inline fn nextComment(state: *State, i: usize) !void {
-    switch (state.in[i]) {
-        '\'' => {
-            if (i == (state.start.? + 1)) {
-                state.mode = .doc_comment;
-            }
-        },
-        '\n' => {
-            if (isValidCommentLen(i - state.start.?)) {
-                try consumeStartExcl(state, .comment, i);
-            } else {
-                try consumeStartExcl(state, .invalid, i);
-            }
-        },
-        else => {
-            // everything else valid
-        },
+inline fn finalize(state: *State, kind: Token.Kind, end: usize) !void {
+    try appendToken(state, kind, state.mode_start.?, end);
+    state.mode = null;
+    state.mode_start = null;
+}
+
+inline fn begin(state: *State, mode: State.Mode, start: usize) void {
+    if (state.mode != null or state.mode_start != null) {
+        @panic("tried to begin a new mode before the current mode was finalized");
     }
+    state.mode = mode;
+    state.mode_start = start;
 }
 
-inline fn isValidCommentLen(len: usize) bool {
-    return len >= 2;
-}
-
-inline fn nextDocComment(state: *State, i: usize) !void {
-    switch (state.in[i]) {
-        '\n' => {
-            if (isValidDocCommentLen(i - state.start.?)) {
-                try consumeStartExcl(state, .doc_comment, i);
-            } else {
-                try consumeStartExcl(state, .invalid, i);
-            }
-        },
-        else => {
-            // everything else valid
-        },
-    }
-}
-
-inline fn isValidDocCommentLen(len: usize) bool {
-    return len >= 3;
-}
-
-fn nextInvalidOrNone(state: *State, i: usize) !void {
-    var new_mode: ?State.Mode = null;
-    var new_token: ?Token.Kind = null;
-    var new_line: bool = false;
-    switch (state.in[i]) {
-        '`' => new_token = .tick,
-        '~' => new_token = .tilde,
-        '!' => new_token = .exclamation,
-        '@' => new_mode = .builtin,
-        '#' => new_mode = .hash,
-        '$' => new_token = .dollar,
-        '%' => new_token = .percent,
-        '^' => new_token = .caret,
-        '&' => new_mode = .ampersand,
-        '*' => new_token = .asterisk,
-        '(' => new_token = .left_paren,
-        ')' => new_token = .right_paren,
-        '-' => new_mode = .minus,
-        '_' => new_mode = .underscore,
-        '=' => new_mode = .equal,
-        '+' => new_token = .plus,
-        '[' => new_token = .left_square,
-        ']' => new_token = .right_square,
-        '{' => new_token = .left_curly,
-        '}' => new_token = .right_curly,
-        '\\' => new_token = .back_slash,
-        '|' => new_mode = .vertical_bar,
-        ';' => new_mode = .semi_colon,
-        ':' => new_mode = .colon,
-        '\'' => new_mode = .comment,
-        '"' => new_mode = .string,
-        ',' => new_token = .comma,
-        '.' => new_mode = .period,
-        '<' => new_token = .less_than,
-        '>' => new_token = .greater_than,
-        '/' => new_token = .forward_slash,
-        '?' => new_token = .question_mark,
-        '0'...'9' => new_mode = .dec_number,
-        'A'...'Z', 'a'...'z' => new_mode = .identifier,
-        ' ', '\t' => new_mode = .none,
-        '\n', '\r' => {
-            new_mode = .none;
-            new_line = true;
-        },
-        else => new_mode = .invalid,
-    }
-
-    const old_mode = state.mode;
-    const old_start = state.start;
-
-    if (new_mode) |nm| {
-        if (nm != old_mode) {
-            state.mode = nm;
-            state.start = i;
-        } else if (old_mode == .invalid) {
-            return;
-        }
-    } else if (new_token) |nt| {
-        try appendToken(state, nt, i, i + 1);
-        state.mode = .none;
-    }
-
-    if (old_mode == .invalid) {
-        try appendToken(state, .invalid, old_start.?, i);
-    }
-
-    if (new_line) {
-        state.line += 1;
-        state.line_start = i + 1;
-    }
-}
-
-inline fn consumeStartIncl(state: *State, kind: Token.Kind, i: usize) !void {
-    try appendToken(state, kind, state.start.?, i + 1);
-    state.mode = .none;
-    state.start = null;
-}
-
-inline fn consumeStartExcl(state: *State, kind: Token.Kind, i: usize) !void {
-    try appendToken(state, kind, state.start.?, i);
-    state.mode = .none;
-    state.start = null;
-    // the char at `i` wasn't consumed so we still have to process it.
-    try nextInvalidOrNone(state, i);
-}
-
-inline fn consumeStartToEnd(state: *State, kind: Token.Kind) !void {
-    try appendToken(state, kind, state.start.?, state.in.len);
+inline fn consume(state: *State, kind: Token.Kind, at: usize) !void {
+    try appendToken(state, kind, at, at + 1);
 }
 
 inline fn appendToken(state: *State, kind: Token.Kind, start: usize, end: usize) !void {
@@ -630,27 +373,31 @@ inline fn appendToken(state: *State, kind: Token.Kind, start: usize, end: usize)
     if (!(start >= state.line_start)) {
         @panic("appendToken recieved a `start` value that was less than `state.line_start`");
     }
-    try state.out.append(Token{
+    try state.tokens.append(Token{
         .kind = kind,
         .start = start,
         .len = end - start,
-        .raw = state.in[start..end],
+        .raw = state.source[start..end],
         .line = state.line,
         .line_offset = start - state.line_start,
     });
 }
 
-// not all of the symbols have been assigned, but they are still reserved by the language so we make sure here that the
-// tokenizer can handle them, because not all of them will show up in the 'comprehensive' test.
-test "all symbols" {
-    try expectTokens("`", &.{.tick});
-    try expectTokens("~", &.{.tilde});
-    try expectTokens("!", &.{.exclamation});
-    try expectTokens("@", &.{.invalid});
-    try expectTokens("#", &.{.invalid});
-    try expectTokens("$", &.{.dollar});
+test "invalid reserved symbols" {
+    try expectTokens("`", &.{.invalid});
+    try expectTokens("~", &.{.invalid});
+    try expectTokens("!", &.{.invalid});
+    try expectTokens("$", &.{.invalid});
+    try expectTokens("^", &.{.invalid});
+    try expectTokens("+", &.{.invalid});
+    try expectTokens("\\", &.{.invalid});
+    try expectTokens("<", &.{.invalid});
+    try expectTokens("/", &.{.invalid});
+}
+
+test "single symbol tokens" {
+    try expectTokens("#", &.{.hash});
     try expectTokens("%", &.{.percent});
-    try expectTokens("^", &.{.caret});
     try expectTokens("&", &.{.ampersand});
     try expectTokens("*", &.{.asterisk});
     try expectTokens("(", &.{.left_paren});
@@ -658,91 +405,279 @@ test "all symbols" {
     try expectTokens("-", &.{.minus});
     try expectTokens("_", &.{.underscore});
     try expectTokens("=", &.{.equal});
-    try expectTokens("+", &.{.plus});
     try expectTokens("[", &.{.left_square});
     try expectTokens("]", &.{.right_square});
     try expectTokens("{", &.{.left_curly});
     try expectTokens("}", &.{.right_curly});
-    try expectTokens("\\", &.{.back_slash});
     try expectTokens("|", &.{.vertical_bar});
     try expectTokens(";", &.{.semi_colon});
     try expectTokens(":", &.{.colon});
-    try expectTokens("'", &.{.invalid});
-    try expectTokens("\"", &.{.invalid});
     try expectTokens(",", &.{.comma});
     try expectTokens(".", &.{.period});
-    try expectTokens("<", &.{.less_than});
     try expectTokens(">", &.{.greater_than});
-    try expectTokens("/", &.{.forward_slash});
     try expectTokens("?", &.{.question_mark});
 }
 
+test "dec_number tokens" {
+    try expectTokens("0", &.{.dec_number});
+    try expectTokens("09", &.{.dec_number});
+    try expectTokens("0_", &.{.invalid});
+}
+
+test "hex_number tokens" {
+    try expectTokens("0x", &.{.invalid});
+    try expectTokens("0x_", &.{.invalid});
+    try expectTokens("0x_0", &.{ .invalid, .dec_number });
+    try expectTokens("0x0_", &.{.invalid});
+    try expectTokens("0x0", &.{.hex_number});
+    try expectTokens("0x0123456789ABCDEF", &.{.hex_number});
+    try expectTokens("0x0_9_A_F", &.{.hex_number});
+}
+
+test "oct_number tokens" {
+    try expectTokens("0o", &.{.invalid});
+    try expectTokens("0o_", &.{.invalid});
+    try expectTokens("0o_0", &.{ .invalid, .dec_number });
+    try expectTokens("0o0_", &.{.invalid});
+    try expectTokens("0o8", &.{ .invalid, .dec_number });
+    try expectTokens("0o9", &.{ .invalid, .dec_number });
+    try expectTokens("0o0", &.{.oct_number});
+    try expectTokens("0o01234567", &.{.oct_number});
+    try expectTokens("0o0_7", &.{.oct_number});
+}
+
+test "bin_number tokens" {
+    try expectTokens("0b", &.{.invalid});
+    try expectTokens("0b_", &.{.invalid});
+    try expectTokens("0b_0", &.{ .invalid, .dec_number });
+    try expectTokens("0b0_", &.{.invalid});
+    try expectTokens("0b2", &.{ .invalid, .dec_number });
+    try expectTokens("0b3", &.{ .invalid, .dec_number });
+    try expectTokens("0b4", &.{ .invalid, .dec_number });
+    try expectTokens("0b5", &.{ .invalid, .dec_number });
+    try expectTokens("0b6", &.{ .invalid, .dec_number });
+    try expectTokens("0b7", &.{ .invalid, .dec_number });
+    try expectTokens("0b8", &.{ .invalid, .dec_number });
+    try expectTokens("0b9", &.{ .invalid, .dec_number });
+    try expectTokens("0b01", &.{.bin_number});
+    try expectTokens("0b0_1", &.{.bin_number});
+}
+
+test "identifier tokens" {
+    // all sequences starting with an alpha character are valid identifiers
+    var i: u8 = 'A';
+    while (i <= 'Z') : (i += 1) {
+        try expectTokens(&.{i}, &.{.identifier});
+    }
+    i = 'a';
+    while (i <= 'z') : (i += 1) {
+        try expectTokens(&.{i}, &.{.identifier});
+    }
+
+    // can't start an identifier with a number
+    try expectTokens("0a", &.{ .dec_number, .identifier });
+    try expectTokens("a0", &.{.identifier});
+
+    // underscores in identifiers are valid
+    try expectTokens("_0", &.{.identifier});
+    try expectTokens("__AZaz09__", &.{.identifier});
+}
+
+test "string tokens" {
+    try expectTokens("\"", &.{.invalid}); // double quote without a closing quote is treated as invalid
+    try expectTokens("\"some string value that's invalid because it's missing the closing quote", &.{.invalid});
+    try expectTokens("\"string value\"", &.{.string});
+    try expectTokens("\"line one\"\n\"line two\"", &.{ .string, .string });
+}
+
+test "builtin tokens" {
+    try expectTokens("@", &.{.invalid});
+    try expectTokens("@0asdf", &.{.builtin});
+    try expectTokens("@asdf0", &.{.builtin});
+    try expectTokens("@_asdf", &.{.builtin});
+}
+
+test "comment tokens" {
+    try expectTokens("'", &.{.comment});
+    try expectTokens("''", &.{.comment});
+    try expectTokens("' some regular comment", &.{.comment});
+}
+
 test "comprehensive" {
-    const source =
-        \\'' Comprehensive source that includes all current language features
+    try expectTokens(
+        \\'' doc comment
         \\
-        \\:= --::std
-        \\:= -::json
-        \\:= _::commands
+        \\:= --::some_lib
+        \\:= -::some_internal_module
+        \\:= _::some_child_module
         \\
-        \\-- ServiceConfig := &{
-        \\    -- endpoint: @str,
+        \\' comment about where and how c lib is packaged or something
+        \\c := --::some_c_lib
+        \\
+        \\-- ProductType := &{
+        \\    -- internal_product_type: &{
+        \\    },
+        \\    -- internal_sum_type: |{
+        \\    },
+        \\    -- internal_enum_type: ;{
+        \\    },
+        \\    - internal_indexed_type: []@some_builtin_indexer(ElementType),
+        \\    - internal_indexed_type2: []@some_builtin_indexer(&{
+        \\        - some_field: @some_type,
+        \\    }),
         \\}
         \\
-        \\-- system := (enabled: @bool, config: ServiceConfig) {
-        \\    ' builtin print
-        \\    @print("Hello World")
+        \\-- some_parameterized_code_block := (
+        \\      first: @conditional,
+        \\      second: some_lib::SomeType,
+        \\      third: @primitive,
+        \\) ReturnType {
+        \\
+        \\    ' assuming first is a branching/conditional primitive
+        \\    ? first {
+        \\        %first {
+        \\          @someLoggingOperation("went from {} to {}", %first, first)
+        \\        }
+        \\
+        \\        :some_parameterized_code_block ReturnType{}
+        \\    } : {
+        \\        @someLoggingOperation("second 'false'")
+        \\    }
+        \\
+        \\    'assuming second is a sum type
+        \\    |second| -> {
+        \\        |SomeType::Opt1(value: Opt1Value)| {
+        \\            @someLoggingOperation("value: {}", value)
+        \\        },
+        \\
+        \\        |SomeType::Opt2(v1: Opt2V1, v2: Opt2V2)| {
+        \\            @someLoggingOperation("value: {}, {}", v1, v2)
+        \\        }
+        \\    } : {
+        \\        @someLoggingOperation("did not match any values")
+        \\    }
+        \\
+        \\    some_local := @range(0, 0xA)
+        \\    (some_local) => (i: @rangeInt) {
+        \\        @someLoggingOperation("{}", (third @plus i))
+        \\    }
+        \\
+        \\    :some_parameterized_code_block ReturnType{}
         \\}
-    ;
-
-    const expected = &.{
-        .doc_comment,
-
-        .colon_equal,
-        .minus_minus,
-        .colon_colon,
-        .identifier,
-
-        .minus_minus,
-        .identifier,
-        .colon_equal,
-        .left_parent,
-        .right_paren,
-        .left_curly,
-
-        .comment,
-
-        .builtin,
-        .left_paren,
-        .string,
-        .right_paren,
-
-        .right_curly,
-    };
-
-    try expectTokens(source, expected);
+    , &.{
+        .comment, //
+        //
+        .colon, .equal, .minus, .minus, .colon, .colon, .identifier, // some_lib
+        .colon, .equal, .minus, .colon, .colon, .identifier, // some_internal_module
+        .colon, .equal, .underscore, .colon, .colon, .identifier, // some_child_module
+        //
+        .comment, //
+        .identifier, .colon, .equal, .minus, .minus, .colon, .colon, .identifier, // some_c_lib
+        //
+        .minus, .minus, .identifier, .colon, .equal, .ampersand, .left_curly, // ProductType
+        .minus, .minus, .identifier, .colon, .ampersand, .left_curly, // internal_product_type
+        .right_curly, .comma, //
+        .minus, .minus, .identifier, .colon, .vertical_bar, .left_curly, // internal_sum_type
+        .right_curly, .comma, //
+        .minus, .minus, .identifier, .colon, .semi_colon, .left_curly, // internal_enum_type
+        .right_curly, .comma, //
+        .minus, .identifier, .colon, .left_square, .right_square, .builtin, .left_paren, .identifier, .right_paren, //-
+        .comma, // internal_indexed_type
+        .minus, .identifier, .colon, .left_square, .right_square, .builtin, .left_paren, .ampersand, //-
+        .left_curly, // internal_indexed_type2
+        .minus, .identifier, .colon, .builtin, .comma, // some_field
+        .right_curly, .right_paren, .comma, //
+        .right_curly, //
+        //
+        .minus, .minus, .identifier, .colon, .equal, .left_paren, // some_parameterized_code_block
+        .identifier, .colon, .builtin, .comma, // first
+        .identifier, .colon, .identifier, .colon, .colon, .identifier, .comma, // second
+        .identifier, .colon, .builtin, .comma, // third
+        .right_paren, .identifier, .left_curly, // ReturnType
+        //
+        .comment, //
+        .question_mark, .identifier, .left_curly, // ?
+        .percent, .identifier, .left_curly, // %
+        .builtin, .left_paren, .string, .comma, .percent, .identifier, .comma, .identifier, .right_paren, //
+        .right_curly, //
+        //
+        .colon, .identifier, .identifier, .left_curly, .right_curly, // :some_parameterized_code_block
+        .right_curly, .colon, .left_curly, //
+        .builtin, .left_paren, .string, .right_paren, // @someLogginOperation
+        .right_curly, //
+        //
+        .comment, //
+        .vertical_bar, .identifier, .vertical_bar, .minus, .greater_than, .left_curly, // |second|
+        .vertical_bar, .identifier, .colon, .colon, .identifier, .left_paren, .identifier, .colon, .identifier, //-
+        .right_paren, .vertical_bar, .left_curly, // Opt1
+        .builtin, .left_paren, .string, .comma, .identifier, .right_paren, //
+        .right_curly, .comma, //
+        //
+        .vertical_bar, .identifier, .colon, .colon, .identifier, .left_paren, .identifier, .colon, .identifier, .comma, //-
+        .identifier, .colon, .identifier, .right_paren, .vertical_bar, .left_curly, // Opt2
+        .builtin, .left_paren, .string, .comma, .identifier, .comma, .identifier, .right_paren, //
+        .right_curly, //
+        .right_curly, .colon, .left_curly, //
+        .builtin, .left_paren, .string, .right_paren, //
+        .right_curly, //
+        //
+        .identifier, .colon, .equal, .builtin, .left_paren, .dec_number, .comma, .hex_number, .right_paren, // some_local
+        .left_paren, .identifier, .right_paren, .equal, .greater_than, .left_paren, .identifier, .colon, .builtin, //-
+        .right_paren, .left_curly, // =>
+        .builtin, .left_paren, .string, .comma, .left_paren, .identifier, .builtin, .identifier, .right_paren, //-
+        .right_paren, //
+        .right_curly, //
+        //
+        .colon, .identifier, .identifier, .left_curly, .right_curly, // :some_parameterized_code_block
+        .right_curly, //
+    });
 }
 
 const print = std.debug.print;
 const testing = std.testing;
 fn expectTokens(source: []const u8, expected: []const Token.Kind) !void {
-    const tokens = try tokenize(testing.allocator, source);
-    defer testing.allocator.free(tokens);
+    const result = try tokenize(testing.allocator, source);
+    defer testing.allocator.free(result);
 
-    testing.expectEqual(tokens.len, expected.len) catch {
-        print("expectTokens tokens.len != expected.len", .{});
+    testing.expectEqual(result.len, expected.len) catch {
+        diffResultVsExpected(result, expected);
         unreachable;
     };
 
-    for (tokens) |token, i| {
+    for (result) |token, i| {
         testing.expectEqual(token.kind, expected[i]) catch {
-            print("\nexpectTokens()\nexpected: {s},\ngot: {s} at line {d} col {d}\n\n", .{
-                @tagName(expected[i]),
-                @tagName(token.kind),
-                token.line,
-                token.line_offset,
-            });
+            diffResultVsExpected(result, expected);
             unreachable;
         };
     }
+}
+
+fn diffResultVsExpected(result: []const Token, expected: []const Token.Kind) void {
+    print("\n", .{});
+
+    var i: usize = 0;
+    var prev_line: usize = 1;
+    while (i < @maximum(result.len, expected.len)) : (i += 1) {
+        const token = if (i < result.len) result[i] else null;
+        if (token) |t| {
+            if (t.line != prev_line) {
+                print("\n", .{});
+                prev_line = t.line;
+            }
+        }
+
+        if (i < expected.len) {
+            print("expected: {s}, ", .{@tagName(expected[i])});
+        } else {
+            print("didn't expect anything, ", .{});
+        }
+
+        if (token) |t| {
+            print("got: {s} at line {d} column {d}.\n", .{ @tagName(t.kind), t.line, t.line_offset });
+        } else {
+            print("didn't get anything.\n", .{});
+        }
+    }
+
+    print("\n", .{});
 }
